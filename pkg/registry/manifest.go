@@ -17,10 +17,13 @@ package registry
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,11 +47,18 @@ type manifest struct {
 	blob        []byte
 }
 
+// used to serialize manefest to disk
+type manifestJson struct {
+	ContentType string
+	Blob        string
+}
+
 type manifests struct {
 	// maps repo -> manifest tag/digest -> manifest
 	manifests map[string]map[string]manifest
 	lock      sync.RWMutex
 	log       *log.Logger
+	dir       string
 }
 
 func isManifest(req *http.Request) bool {
@@ -215,6 +225,11 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 		// See https://docs.docker.com/engine/reference/commandline/pull/#pull-an-image-by-digest-immutable-identifier.
 		m.manifests[repo][digest] = mf
 		m.manifests[repo][target] = mf
+
+		if m.dir != "" {
+			m.save(repo) //write to disk
+		}
+
 		resp.Header().Set("Docker-Content-Digest", digest)
 		resp.WriteHeader(http.StatusCreated)
 		return nil
@@ -240,6 +255,9 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 		}
 
 		delete(m.manifests[repo], target)
+		if m.dir != "" {
+			m.delete(repo, target) //write to disk
+		}
 		resp.WriteHeader(http.StatusAccepted)
 		return nil
 
@@ -440,5 +458,118 @@ func (m *manifests) handleReferrers(resp http.ResponseWriter, req *http.Request)
 	resp.Header().Set("Content-Type", string(types.OCIImageIndex))
 	resp.WriteHeader(http.StatusOK)
 	io.Copy(resp, bytes.NewReader([]byte(msg)))
+	return nil
+}
+
+// load will load manifests from disk
+func (m *manifests) load() *regError {
+	dir := filepath.Join(m.dir, "manifests")
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	repos, err := os.ReadDir(dir)
+	if err != nil {
+		return &regError{
+			Status:  http.StatusInternalServerError,
+			Code:    "MANIFEST_LOAD_ERROR",
+			Message: "Unable to load manifests",
+		}
+	}
+
+	for _, r := range repos {
+		if !r.IsDir() {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(dir, r.Name()))
+		if err != nil {
+			return &regError{
+				Status:  http.StatusInternalServerError,
+				Code:    "MANIFEST_REPO_LOAD_ERROR",
+				Message: "Unable to load repo from manifest",
+			}
+		}
+
+		m.manifests[r.Name()] = make(map[string]manifest)
+
+		for _, file := range files {
+			if !file.IsDir() {
+				b, err := os.ReadFile(filepath.Join(dir, r.Name(), file.Name()))
+				if err != nil {
+					return &regError{
+						Status:  http.StatusInternalServerError,
+						Code:    "MANIFEST_FILE_READ_ERROR",
+						Message: "Unable to read file from manifest",
+					}
+				}
+				var mj manifestJson
+				err = json.Unmarshal(b, &mj)
+				if err != nil {
+					return &regError{
+						Status:  http.StatusInternalServerError,
+						Code:    "MANIFEST_FILE_DESERIALIZATION_ERROR",
+						Message: "Unable to deserialize contents from file manifest",
+					}
+				}
+				tmp := manifest{contentType: mj.ContentType, blob: []byte(mj.Blob)}
+				m.manifests[r.Name()][file.Name()] = tmp
+			}
+		}
+	}
+	return nil
+}
+
+// save will write the manifest to disk.
+func (m *manifests) save(repo string) *regError {
+	dir := filepath.Join(m.dir, "manifests")
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		err := os.Mkdir(dir, os.ModePerm)
+		if err != nil {
+			return &regError{
+				Status:  http.StatusInternalServerError,
+				Code:    "MANIFEST_SAVE_ERROR",
+				Message: "Unable to save manifest",
+			}
+		}
+	}
+
+	repoDir := filepath.Join(dir, repo)
+	if _, err := os.Stat(repoDir); errors.Is(err, os.ErrNotExist) {
+		err := os.Mkdir(repoDir, os.ModePerm)
+		if err != nil {
+			return &regError{
+				Status:  http.StatusInternalServerError,
+				Code:    "MANIFEST_REPO_SAVE_ERROR",
+				Message: "Unable to save repo manifest",
+			}
+		}
+	}
+
+	for k, v := range m.manifests[repo] {
+		tagFile := filepath.Join(repoDir, k)
+		mj := manifestJson{ContentType: v.contentType, Blob: string(v.blob)}
+		j, err := json.Marshal(mj)
+		if err != nil {
+			return &regError{
+				Status:  http.StatusInternalServerError,
+				Code:    "MANIFEST_FILE_SERIALIZATION_ERROR",
+				Message: "Unable to serialize manifest file",
+			}
+		}
+		os.WriteFile(tagFile, j, os.ModePerm)
+	}
+	return nil
+}
+
+// save will write the manifest to disk.
+func (m *manifests) delete(repo string, tag string) *regError {
+	err := os.Remove(filepath.Join(m.dir, "manifests", repo, tag))
+	if err != nil {
+		return &regError{
+			Status:  http.StatusInternalServerError,
+			Code:    "MANIFEST_FILE_DELETE_ERROR",
+			Message: "Unable to delete manifest file",
+		}
+	}
 	return nil
 }

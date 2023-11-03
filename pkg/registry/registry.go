@@ -142,3 +142,13 @@ func WithBlobHandler(h BlobHandler) Option {
 		r.blobs.blobHandler = h
 	}
 }
+
+func WithDiskManifest(dir string) Option {
+	return func(r *registry) {
+		if dir != "" {
+			r.manifests.dir = dir
+			r.manifests.load()
+		}
+
+	}
+}

@@ -37,15 +37,22 @@ func newCmdRegistry() *cobra.Command {
 }
 
 func newCmdServe() *cobra.Command {
-	var disk bool
+	//var disk bool
+	var disk string
 	cmd := &cobra.Command{
 		Use:   "serve",
-		Short: "Serve an in-memory registry implementation",
-		Long: `This sub-command serves an in-memory registry implementation on an automatically chosen port (or $PORT)
+		Short: "Serve an in-memory or on-disk registry",
+		Long: `This sub-command serves an in-memory or on-disk registry implementation
+
+PORT: randomly chosen or you can set via environment variable ($PORT)
+
+For on-disk
+-------------
+Use the hidden parameter --blobs-to-disk ./images
 
 The command blocks while the server accepts pushes and pulls.
 
-Contents are only stored in memory, and when the process exits, pushed data is lost.`,
+For in-memory registry, when the process exits, pushed data is lost.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
@@ -62,15 +69,20 @@ Contents are only stored in memory, and when the process exits, pushed data is l
 			port = fmt.Sprintf("%d", porti)
 
 			bh := registry.NewInMemoryBlobHandler()
-			if disk {
-				tmp := os.TempDir()
-				log.Printf("storing blobs in %s", tmp)
-				bh = registry.NewDiskBlobHandler(tmp)
+			if disk != "" {
+				if _, err := os.Stat(disk); errors.Is(err, os.ErrNotExist) {
+					err := os.Mkdir(disk, os.ModePerm)
+					if err != nil {
+						log.Fatalln(err)
+					}
+				}
+				bh = registry.NewDiskBlobHandler(disk)
+				log.Printf("serving on-disk registry at %s", disk)
 			}
 
 			s := &http.Server{
 				ReadHeaderTimeout: 5 * time.Second, // prevent slowloris, quiet linter
-				Handler:           registry.New(registry.WithBlobHandler(bh)),
+				Handler:           registry.New(registry.WithBlobHandler(bh), registry.WithDiskManifest(disk)),
 			}
 			log.Printf("serving on port %s", port)
 
@@ -89,7 +101,8 @@ Contents are only stored in memory, and when the process exits, pushed data is l
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&disk, "blobs-to-disk", false, "Store blobs on disk")
+	cmd.Flags().StringVar(&disk, "blobs-to-disk", "", "Store blobs on disk at the given path")
+	//cmd.Flags().BoolVar(&disk, "blobs-to-disk", false, "Store blobs on disk")
 	cmd.Flags().MarkHidden("blobs-to-disk")
 	return cmd
 }
